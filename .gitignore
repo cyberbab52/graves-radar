@@ -1,0 +1,26 @@
+# Captures IQ et leurs métadonnées (contiennent la position du récepteur)
+*.npy
+graves_*.json
+
+# Catalogues orbitaux Space-Track / Celestrak (redistribution interdite par Space-Track)
+catalogue_*.json
+tle_*.txt
+*.bsp
+
+# Journaux ADS-B (adsb.fi : usage personnel non commercial)
+adsb_*.jsonl
+
+# Sorties générées
+*.png
+echos.csv
+
+# Identifiants et configuration locale
+spacetrack.ini
+station.ini
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

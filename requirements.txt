@@ -1,0 +1,17 @@
+# Analyse et tracés
+numpy
+scipy
+matplotlib
+
+# Mécanique orbitale (graves_satellites.py, graves_doppler.py)
+sgp4
+skyfield
+skyfield-data
+
+# Affichage en direct V2 (graves_v2.py) — système : libxcb-cursor0
+PyQt6
+pyqtgraph
+
+# Acquisition SDR : SoapySDR et SoapySDRPlay3 ne s'installent pas par pip.
+# Installer l'API SDRplay, puis SoapySDR (paquets de la distribution ou compilation)
+# et le module SoapySDRPlay3 : https://github.com/pothosware/SoapySDRPlay3
