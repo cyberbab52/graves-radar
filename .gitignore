@@ -2,6 +2,10 @@
 *.npy
 graves_*.json
 
+# Calage GPS : IQ brut gardé (--garder) et cache des éphémérides
+gps_*.cs8
+gps_*.json
+
 # Catalogues orbitaux Space-Track / Celestrak (redistribution interdite par Space-Track)
 catalogue_*.json
 tle_*.txt

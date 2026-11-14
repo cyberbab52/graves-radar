@@ -37,6 +37,9 @@ import graves_adsb as adsb                                            # noqa: E4
 FIN_RES, FIN_LARG = 0.5, 600.0        # Hz, demi-largeur analysée en cascade fine
 RAP_RES, RAP_LARG = 8.0, 5500.0       # Hz, demi-largeur utile (filtre de décimation au-delà)
 SEUIL_FIN, SEUIL_RAP = 9.0, 10.0      # dB au-dessus du fond
+PERIODE_FAISCEAU_S = 3.2              # commutation des faisceaux de GRAVES : un avion est éclairé par bouffées
+TOL_FAISCEAU_S = 0.6                  # tolérance sur les intervalles k × 3,2 s
+ECART_VOISIN_HZ = 15.0                # « raie stable » : vol ADS-B signalé s'il passe à moins de cet écart
 
 COULEURS = {
     "avion ADS-B": "#ffffff",
@@ -209,6 +212,17 @@ def decrire(seg):
                 rms=float(np.sqrt(np.mean((f - lisse) ** 2))), npix=len(t), fit=fit)
 
 
+def ecart_courbe(d, r, tt):
+    """Écart médian (Hz) entre une trace d (cascade fine) et la courbe Doppler ADS-B du vol r,
+    sur la partie commune ; None si elles se recouvrent trop peu."""
+    tm = np.linspace(d["t0"], d["t1"], 25)
+    fd = np.interp(tm, tt, r["c"]["fd"], left=np.nan, right=np.nan)
+    ok = ~np.isnan(fd)
+    if ok.sum() < 5:
+        return None
+    return float(np.median(np.abs(d["fit"](tm[ok]) - fd[ok])))
+
+
 # ----------------------------------------------------------------------------- analyse
 def analyser(args):
     iq, fs, t0 = adsb.charger_capture(args.iq, args.decalage_temps)
@@ -304,23 +318,32 @@ def analyser(args):
             print("ADS-B : aucun journal pour cette période (les avions resteront « sans ADS-B »)")
 
     for d in traces:
+        # vol ADS-B identifié dont la courbe suit la trace (écart médian ≤ 4 Hz) : testé EN PREMIER.
+        # Un avion qui vole le long de l'axe GRAVES–récepteur, ou loin, garde un Doppler presque constant
+        # pendant toute la capture : il ne doit pas être pris pour une « raie stable ».
         meilleur, ecart_min = None, 1e9
-        tm = np.linspace(d["t0"], d["t1"], 25)
         for r in resultats:
-            fd = np.interp(tm, tt, r["c"]["fd"], left=np.nan, right=np.nan)
-            ok = ~np.isnan(fd)
-            if ok.sum() < 5:
-                continue
-            e = float(np.median(np.abs(d["fit"](tm[ok]) - fd[ok])))
-            if e < ecart_min:
+            e = ecart_courbe(d, r, tt)
+            if e is not None and e < ecart_min:
                 meilleur, ecart_min = r, e
-        if abs(d["pente"]) > args.pente_max_avion:
-            d.update(classe="satellite", detail="trace longue à forte pente (cascade fine)")
-        elif d["duree"] > 0.8 * tt[-1] and abs(d["pente"]) < 0.05 and abs(d["f0"]) > 2:
-            d.update(classe="raie stable", detail="présente toute la capture (Lune ? parasite ?)")
-        elif meilleur is not None and ecart_min <= 4.0:
+        if meilleur is not None and ecart_min <= 4.0:
             d.update(classe="avion ADS-B", detail=f"{meilleur['flight']} — {meilleur['alt']:.0f} ft, "
                                                   f"{meilleur['dT']:.0f} km de GRAVES, écart {ecart_min:.1f} Hz")
+        elif abs(d["pente"]) > args.pente_max_avion:
+            d.update(classe="satellite", detail="trace longue à forte pente (cascade fine)")
+        elif d["duree"] > 0.8 * tt[-1] and abs(d["pente"]) < 0.05 and abs(d["f0"]) > 2:
+            # vol ADS-B (identifié ou non) le plus proche de la trace : indice pour trancher à l'œil
+            voisin, e_v = None, 1e9
+            for r in tous_resultats:
+                e = ecart_courbe(d, r, tt)
+                if e is not None and e < e_v:
+                    voisin, e_v = r, e
+            proche = (f" — vol ADS-B le plus proche : {voisin['flight']} ({voisin['alt']:.0f} ft, "
+                      f"{voisin['dT']:.0f} km de GRAVES), écart médian {e_v:.1f} Hz : même avion ?"
+                      if voisin is not None and e_v <= ECART_VOISIN_HZ else "")
+            d.update(classe="raie stable",
+                     detail="fréquence presque fixe toute la capture (avion sur l'axe GRAVES–récepteur, "
+                            "Lune, parasite ?)" + proche)
         elif max(abs(d["fmin"]), abs(d["fmax"])) > args.fd_max_avion:
             v = max(abs(d["fmin"]), abs(d["fmax"])) * adsb.LAMBDA / 2
             d.update(classe="objet rapide", detail=f"Doppler hors de portée d'un avion (≥ {v:.0f} m/s) : "
@@ -566,26 +589,66 @@ def agreger_saturations(echos, ecart_s=10.0, mini=3):
     return autres
 
 
-def regrouper_recurrents(echos, tous_resultats, tt, args):
-    """Des « météores » longs (≥ 1 s) qui reviennent ≥ 3 fois à la même fréquence en quelques minutes
-    sont en réalité l'écho haché d'un avion (faisceau balayé). On les regroupe et on cherche le vol."""
-    cand = sorted([e for e in echos if e["classe"] == "météore" and e["duree"] >= 1.0], key=lambda e: e["t0"])
+def au_rythme_du_faisceau(g, periode=PERIODE_FAISCEAU_S, tol=TOL_FAISCEAU_S, k_max=6):
+    """Vrai si les débuts des événements du groupe sont espacés de multiples de la période de commutation
+    des faisceaux (k × 3,2 s, k = 1…6) pour au moins deux tiers des intervalles : c'est la signature d'un
+    écho continu (avion) découpé par le balayage, et non de météores, qui arrivent au hasard."""
+    t = np.sort([e["t0"] for e in g])
+    d = np.diff(t)
+    if len(d) < 2:
+        return False
+    k = np.round(d / periode)
+    ok = (k >= 1) & (k <= k_max) & (np.abs(d - k * periode) <= tol)
+    return int(ok.sum()) >= max(2, math.ceil(2 * len(d) / 3))
+
+
+def _centre(e):
+    return 0.5 * (e["fmin"] + e["fmax"])
+
+
+def _former_groupes(cand, plus_proche=False, ecart_s=60.0, tol_hz=12.0):
+    """Groupes de « météores » successifs à la même fréquence (± tol_hz, ≤ ecart_s entre deux morceaux).
+    plus_proche=False : chaque morceau rejoint le premier groupe compatible (règle d'origine) ;
+    True : le groupe dont le dernier morceau est le plus proche en fréquence."""
     groupes = []
     for e in cand:
-        fe = 0.5 * (e["fmin"] + e["fmax"])
+        fe = _centre(e)
+        choix, d_min = None, 1e9
         for g in groupes:
-            if e["t0"] - g[-1]["t1"] <= 60 and abs(fe - 0.5 * (g[-1]["fmin"] + g[-1]["fmax"])) <= 12:
-                g.append(e)
-                break
-        else:
+            if e["t0"] - g[-1]["t1"] <= ecart_s:
+                d = abs(fe - _centre(g[-1]))
+                if d <= tol_hz and d < d_min:
+                    choix, d_min = g, d
+                    if not plus_proche:
+                        break
+        if choix is None:
             groupes.append([e])
+        else:
+            choix.append(e)
+    return groupes
+
+
+def regrouper_recurrents(echos, tous_resultats, tt, args, duree_min=0.4):
+    """« Météores » qui reviennent ≥ 3 fois à la même fréquence en quelques dizaines de secondes : en réalité
+    l'écho haché d'un avion (faisceau balayé). On les regroupe et on cherche le vol. Deux passes :
+      1) critère d'origine : morceaux de ≥ 1 s (inchangé) ;
+      2) parmi les morceaux restants de ≥ duree_min (0,4 s), groupes qui reviennent au rythme du faisceau
+         (multiples de 3,2 s) — ce qui attrape les morceaux courts sans perturber les groupes de la passe 1."""
+    meteores = sorted([e for e in echos if e["classe"] == "météore"], key=lambda e: e["t0"])
+    retenus = []                                       # (groupe, au rythme du faisceau ?)
+    for g in _former_groupes([e for e in meteores if e["duree"] >= 1.0]):
+        if len(g) >= 3:
+            retenus.append((g, au_rythme_du_faisceau(g)))
+    pris = {id(e) for g, _ in retenus for e in g}
+    reste = [e for e in meteores if e["duree"] >= duree_min and id(e) not in pris]
+    for g in _former_groupes(reste, plus_proche=True):
+        if len(g) >= 3 and au_rythme_du_faisceau(g):
+            retenus.append((g, True))
     retires = []
-    for g in groupes:
-        if len(g) < 3:
-            continue
+    for g, rythme in retenus:
         retires += g
         tm = np.array([0.5 * (e["t0"] + e["t1"]) for e in g])
-        fm = np.array([0.5 * (e["fmin"] + e["fmax"]) for e in g])
+        fm = np.array([_centre(e) for e in g])
         nom, best = None, 1e9
         for r in tous_resultats:
             fd = np.interp(tm, tt, r["c"]["fd"], left=np.nan, right=np.nan)
@@ -595,14 +658,15 @@ def regrouper_recurrents(echos, tous_resultats, tt, args):
                 if err < best:
                     nom, best = r, err
         n_g = len(g)
+        quoi = f"{n_g} échos hachés" + (f" au rythme du faisceau ({PERIODE_FAISCEAU_S:g} s)" if rythme else "")
         base = dict(t0=g[0]["t0"], t1=g[-1]["t1"], duree=g[-1]["t1"] - g[0]["t0"], f0=float(fm[0]), f1=float(fm[-1]),
                     fmin=min(e["fmin"] for e in g), fmax=max(e["fmax"] for e in g),
                     pente=float((fm[-1] - fm[0]) / max(tm[-1] - tm[0], 1e-3)), snr=max(e["snr"] for e in g),
                     vue="rapide", groupe=g)
         if nom is not None and best <= 8:
-            base.update(classe="avion ADS-B", detail=f"{nom['flight']} — probable, {n_g} échos hachés, écart {best:.1f} Hz")
+            base.update(classe="avion ADS-B", detail=f"{nom['flight']} — probable, {quoi}, écart {best:.1f} Hz")
         else:
-            base.update(classe="avion sans ADS-B", detail=f"{n_g} échos hachés récurrents vers {np.median(fm):+.0f} Hz")
+            base.update(classe="avion sans ADS-B", detail=f"{quoi} récurrents vers {np.median(fm):+.0f} Hz")
         echos.append(base)
     return [e for e in echos if not any(e is x for x in retires)]
 

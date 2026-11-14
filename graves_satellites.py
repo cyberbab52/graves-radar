@@ -19,6 +19,16 @@ Modes :
      fréquence. Un objet est identifié si son score dépasse nettement celui des leurres.
      python3 graves_satellites.py superpose graves_20261106_001313_iq_16666.npy
          → tableau + graves_..._satellites.png
+     L'écho est cherché sur le meilleur tronçon de 60 s de chaque courbe (--troncon) : un satellite n'est
+     éclairé par GRAVES que pendant sa traversée du volume couvert (20 à 60 s).
+     Verdicts : ÉCHO IDENTIFIÉ (z ≥ z-min et ≥ min-forts tranches nettement au-dessus du fond) ;
+     CANDIDAT (z ≥ z-min, mais écho trop faible pour être confirmé : détection probable, à vérifier
+     sur l'image) ; « confondu avec … » (score dû à l'écho d'un objet déjà identifié).
+
+Fenêtre Doppler : ±7 kHz (--fenetre). Le filtre de décimation de graves_capture.py atténue de 2 dB à
+6,5 kHz (repliement à −46 dB) et de 3,6 dB à 7 kHz : les courbes sont évaluées jusqu'à fenêtre − 500 Hz.
+Les objets dont l'orbite calculée passe sous 150 km d'altitude (retombés, en rentrée, éléments périmés)
+sont écartés : leur prévision n'a plus de sens.
 
 Identifiants Space-Track (jamais dans le code) :
    variables d'environnement SPACETRACK_USER et SPACETRACK_PASSWORD, ou fichier
@@ -51,7 +61,14 @@ import graves_adsb as adsb                                            # noqa: E4
 
 LAMBDA = adsb.LAMBDA
 OMEGA_TERRE = 7.292115e-5                       # rad/s
-FENETRE_HZ = 5400.0                             # demi-largeur utile de la cascade rapide
+FENETRE_HZ = 7000.0                             # demi-largeur de la cascade rapide analysée (défaut de --fenetre)
+MARGE_BORD_HZ = 500.0                           # courbes évaluées jusqu'à fenêtre − marge
+TRONCON_S = 60.0                                # score sur le meilleur tronçon de 60 s de la courbe (défaut de --troncon)
+MAX_TESTES = 1500                               # objets testés au plus (les plus détectables, défaut de --max)
+PLAFOND_DB = 12.0                               # case de la cascade plafonnée pour le score (défaut de --plafond)
+GARDE_COURBES = 30                              # courbes gardées (et tracées avec --tous) des objets non retenus
+ALT_MIN_KM = 150.0                              # en dessous : objet retombé ou en rentrée, prévision sans valeur
+RAYON_TERRE_KM = 6371.0
 RCS_M2 = {"SMALL": 0.05, "MEDIUM": 0.5, "LARGE": 5.0}   # ordres de grandeur des classes Space-Track
 
 ST_BASE = "https://www.space-track.org"
@@ -227,6 +244,11 @@ def propager(cat, t_unix):
     return R, V
 
 
+def altitude_km(R):
+    """Altitude approchée (km) au-dessus d'une Terre sphérique : suffisant pour écarter les objets en rentrée."""
+    return np.linalg.norm(R, axis=-1) / 1000.0 - RAYON_TERRE_KM
+
+
 def geometrie(R, V, rx=adsb.RX_EXEMPLE, tx=adsb.GRAVES):
     """Doppler bistatique (Hz), élévations (°) vues de GRAVES et du récepteur, distances (km)."""
     T = adsb.ecef(*tx)
@@ -248,16 +270,26 @@ def indice_detectabilite(obj, dT_km, dR_km):
     return 10 * np.log10(sigma) - 20 * np.log10(dT_km / 1000) - 20 * np.log10(dR_km / 1000)
 
 
-def candidats(cat, t0, t1, rx, pas=10.0, el_min=0.0, fenetre=FENETRE_HZ, par_bloc=4000):
-    """Objets au-dessus de l'horizon des deux sites avec un Doppler dans la fenêtre, entre t0 et t1."""
+def candidats(cat, t0, t1, rx, pas=10.0, el_min=0.0, fenetre=5400.0, par_bloc=4000, ecartes=None):
+    """Objets au-dessus de l'horizon des deux sites avec un Doppler dans la fenêtre, entre t0 et t1.
+    fenetre : 5400 Hz par défaut, largeur de la cascade de l'analyse en direct (graves_direct.py, ±5,5 kHz) ;
+    identifier() et passages passent la fenêtre réellement analysée.
+    Les objets dont l'orbite calculée descend sous ALT_MIN_KM sont écartés (leur nombre est ajouté à
+    ecartes["rentree"] si un dictionnaire est fourni)."""
     tq = np.arange(t0 - pas, t1 + 2 * pas, pas)
     garde = []
     for d in range(0, len(cat), par_bloc):
         sous = cat.sous_ensemble(list(range(d, min(d + par_bloc, len(cat)))))
         R, V = propager(sous, tq)
         fd, elT, elR, nT, nR = geometrie(R, V, rx)
+        bas = np.nanmin(np.where(np.isnan(R[..., 0]), np.inf, altitude_km(R)), axis=1) < ALT_MIN_KM
         ok = (elT > el_min) & (elR > el_min) & (np.abs(fd) <= fenetre + 500)
         for i in np.where(ok.any(axis=1))[0]:
+            if bas[i]:
+                if ecartes is not None:
+                    ecartes["rentree"] = ecartes.get("rentree", 0) + 1
+                    ecartes.setdefault("noms", []).append(sous.objets[i]["nom"])
+                continue
             j = np.where(ok[i])[0]
             garde.append((d + i, float(indice_detectabilite(sous.objets[i], nT[i, j].min(), nR[i, j].min()))))
     garde.sort(key=lambda x: -x[1])
@@ -271,7 +303,7 @@ def courbes_fines(cat, idx, t_abs, rx, pas=1.0):
     tq = np.arange(t_abs[0] - 15, t_abs[-1] + 15 + pas, pas)
     R, V = propager(sous, tq)
     fd, elT, elR, nT, nR = geometrie(R, V, rx)
-    visible = (elT > 0) & (elR > 0)
+    visible = (elT > 0) & (elR > 0) & (altitude_km(R) > ALT_MIN_KM)
     fd = np.where(visible, fd, np.nan)
     return tq, fd, nT, nR
 
@@ -290,13 +322,15 @@ def mode_superpose(args):
         iq, _ = adsb.corriger_derive(iq, fs, f, tt, S, off)
     fr, tr, Sr = cascade(iq, fs, args.resolution)
     fr = fr - off
-    m = np.abs(fr) <= FENETRE_HZ
+    fenetre = min(args.fenetre, 0.5 * fs - 500)
+    m = np.abs(fr) <= fenetre
     fr, Sr = fr[m], Sr[m]
-    norm = Sr - np.median(Sr, axis=1, keepdims=True)
+    norm = (Sr - np.median(Sr, axis=1, keepdims=True)).astype(np.float32)
     norm -= np.median(norm, axis=0, keepdims=True)
+    del Sr, S, iq                                    # plus utiles : mémoire libérée (le Jetson partage la sienne)
     debut = datetime.fromtimestamp(t0, timezone.utc)
     print(f"Capture du {debut:%Y-%m-%d %H:%M:%S} UTC, {tr[-1]:.0f} s — catalogue {os.path.basename(cat.fichier)} "
-          f"({len(cat)} objets)")
+          f"({len(cat)} objets) — fenêtre Doppler ±{fenetre / 1000:.1f} kHz")
 
     resultats = identifier(cat, fr, tr, norm, t0, rx, args)
     if resultats is None:
@@ -308,20 +342,63 @@ def mode_superpose(args):
     return resultats
 
 
+def _score_courbe(Pm, K, ok, L, min_tranches, K_exclu=None, fond=1.0):
+    """Puissance moyenne lue le long d'une courbe (indices de fréquence K, tranches valides ok).
+    L > 0 : moyenne sur le MEILLEUR tronçon de L tranches valides consécutives (un satellite ne renvoie d'écho que
+    pendant sa traversée du volume éclairé par GRAVES, 20 à 60 s : moyenner toute la courbe diluerait cet écho).
+    K_exclu : trace du candidat lui-même (indices de fréquence par tranche, NaN hors courbe) ; pour une courbe
+    leurre, les pixels à ±2 cases de cette trace valent « fond » : un leurre décalé en fréquence puis glissé
+    dans le temps peut sinon retomber sur le vrai écho dès que la courbe est raide (pente × τ ≈ décalage).
+    Retourne (score, (j_debut, j_fin)) ou (nan, None)."""
+    j = np.where(ok)[0]
+    if len(j) < min_tranches:
+        return np.nan, None
+    v = Pm[K[j].astype(int), j]
+    if K_exclu is not None:
+        v = np.where(np.abs(K[j] - K_exclu[j]) <= 2, fond, v)
+    if L <= 0 or len(v) <= L:
+        return float(v.mean()), (int(j[0]), int(j[-1]))
+    cs = np.concatenate([[0.0], np.cumsum(v)])
+    m = (cs[L:] - cs[:-L]) / L
+    i = int(np.argmax(m))
+    return float(m[i]), (int(j[i]), int(j[i + L - 1]))
+
+
 def identifier(cat, fr, tr, norm, t0, rx, args, bavard=True):
     """Filtre adapté le long des courbes Doppler prévues. norm : cascade rapide normalisée (dB au-dessus
-    du fond), fr : fréquences relatives à la porteuse, tr : temps depuis t0. Retourne la liste des objets testés."""
+    du fond), fr : fréquences relatives à la porteuse, tr : temps depuis t0. Retourne la liste des objets testés.
+    Le score est la puissance moyenne sur le meilleur tronçon de --troncon secondes de la courbe (0 = courbe
+    entière), comparée à celle de courbes leurres décalées en fréquence, traitées de la même façon.
+    Chaque résultat porte « identifie » (bool) et « candidat » (bool : z ≥ z_min mais écho trop faible ou trop
+    fragile pour être confirmé), et « seg » (début, fin du tronçon retenu, en s depuis t0)."""
     from scipy.ndimage import maximum_filter1d
-    P = 10 ** (np.clip(norm, -30, 40) / 10)                    # rapport de puissance au fond
+    fenetre = float(getattr(args, "fenetre", None) or max(abs(fr[0]), abs(fr[-1])))
+    f_lim = min(fenetre, max(abs(fr[0]), abs(fr[-1]))) - MARGE_BORD_HZ   # bord utile de la cascade fournie
+    # rapport de puissance au fond, PLAFONNÉ : un écho de satellite fait quelques dB ; une case à +40 dB (écho d'avion
+    # proche, porteuse, parasite) croisée par une courbe pendant 3 tranches suffirait sinon à faire bondir la moyenne
+    # du tronçon et à « identifier » n'importe quel objet qui passe par là
+    plafond = float(getattr(args, "plafond", PLAFOND_DB))
+    P = (10 ** (np.clip(norm, -30, plafond) / 10)).astype(np.float32)   # float32 : mémoire
     P[np.abs(fr) <= 20, :] = np.median(P)                      # porteuse et ses abords neutralisés
     Pm = maximum_filter1d(P, size=3, axis=0)                   # tolérance ±1 case
+    fond_pm = float(np.median(Pm))
     df = fr[1] - fr[0]
+    dt = float(tr[1] - tr[0]) if len(tr) > 1 else 0.06
+    troncon = float(getattr(args, "troncon", TRONCON_S))
+    L = int(round(troncon / dt)) if troncon > 0 else 0
     t_abs = t0 + tr
     t_calc = time.time()
-    cands = candidats(cat, t_abs[0], t_abs[-1], rx)
+    ecartes = {}
+    cands = candidats(cat, t_abs[0], t_abs[-1], rx, fenetre=f_lim + MARGE_BORD_HZ, ecartes=ecartes)
     if bavard:
-        print(f"{len(cands)} objets au-dessus de l'horizon de GRAVES et du récepteur avec un Doppler dans ±{FENETRE_HZ/1000:.1f} kHz "
-              f"(calcul {time.time() - t_calc:.1f} s)")
+        print(f"{len(cands)} objets au-dessus de l'horizon de GRAVES et du récepteur avec un Doppler dans "
+              f"±{(f_lim + MARGE_BORD_HZ) / 1000:.1f} kHz (calcul {time.time() - t_calc:.1f} s)")
+        if ecartes.get("rentree"):
+            noms = ", ".join(ecartes["noms"][:5]) + (" …" if len(ecartes["noms"]) > 5 else "")
+            print(f"{ecartes['rentree']} objet(s) écarté(s) : orbite calculée sous {ALT_MIN_KM:.0f} km "
+                  f"(retombé, en rentrée ou éléments périmés) — {noms}")
+        if len(cands) > args.max:
+            print(f"Les {args.max} plus détectables sont testés (--max pour en tester davantage)")
     cands = cands[: args.max]
     if not cands:
         return []
@@ -331,33 +408,41 @@ def identifier(cat, fr, tr, norm, t0, rx, args, bavard=True):
     taus = np.arange(-args.tau_max, args.tau_max + 1e-9, 0.25)
     decal_null = np.array([-461, -337, -211, -149, 151, 223, 347, 457], float)
     resultats = []
+    t_corr = time.time()
     for n, (i_cat, idet) in enumerate(cands):
         fd_q = FD[n]
         if np.all(np.isnan(fd_q)):
             continue
         # matrice (τ, tranche) des fréquences prévues : écho observé à t  ↔  prévision à t + τ
         F = np.array([np.interp(tr + t0 + tau, tq, fd_q, left=np.nan, right=np.nan) for tau in taus])
-        valide = ~np.isnan(F) & (np.abs(F) <= FENETRE_HZ - 500) & (np.abs(F) > 25)
+        valide = ~np.isnan(F) & (np.abs(F) <= f_lim) & (np.abs(F) > 25)
         if valide.sum(axis=1).max() < args.min_tranches:
             continue
         scores = np.full((len(decal_null) + 1, len(taus)), np.nan)
-        for s, dec in enumerate(np.r_[0.0, decal_null]):
-            K = np.round((F + dec - fr[0]) / df)
-            ok = valide & (K >= 0) & (K < len(fr))
-            for a in range(len(taus)):
-                j = np.where(ok[a])[0]
-                if len(j) >= args.min_tranches:
-                    scores[s, a] = Pm[K[a, j].astype(int), j].mean()
+        segs = [None] * len(taus)
+        K0 = np.round((F - fr[0]) / df)                  # 1) la courbe elle-même, à chaque recalage τ
+        ok0 = valide & (K0 >= 0) & (K0 < len(fr))
+        for a in range(len(taus)):
+            scores[0, a], segs[a] = _score_courbe(Pm, K0[a], ok0[a], L, args.min_tranches)
         if np.all(np.isnan(scores[0])):
             continue
         a_best = int(np.nanargmax(scores[0]))
+        K_trace = np.where(ok0[a_best], K0[a_best], np.nan)   # trace du candidat au meilleur recalage
+        for s_, dec in enumerate(decal_null, start=1):   # 2) les leurres, trace du candidat neutralisée
+            K = np.round((F + dec - fr[0]) / df)
+            ok = valide & (K >= 0) & (K < len(fr))
+            for a in range(len(taus)):
+                scores[s_, a], _ = _score_courbe(Pm, K[a], ok[a], L, args.min_tranches, K_trace, fond_pm)
         meilleur = scores[0, a_best]
-        # affinage du recalage au 1/20 s autour du meilleur pas grossier
+        j0, j1 = segs[a_best]
+        # affinage du recalage au 1/20 s autour du meilleur pas grossier, sur le tronçon retenu
         # (puissance lue exactement sur la courbe, interpolée entre cases : pas de plateau de tolérance)
         tau_fin, F_fin, sc_fin = taus[a_best], None, -np.inf
+        dans = np.zeros(len(tr), bool)
+        dans[j0:j1 + 1] = True
         for tau in np.arange(taus[a_best] - 0.5, taus[a_best] + 0.5001, 0.05):
             Fi = np.interp(tr + t0 + tau, tq, fd_q, left=np.nan, right=np.nan)
-            vi = ~np.isnan(Fi) & (np.abs(Fi) <= FENETRE_HZ - 500) & (np.abs(Fi) > 25)
+            vi = ~np.isnan(Fi) & (np.abs(Fi) <= f_lim) & (np.abs(Fi) > 25) & dans
             x = (Fi - fr[0]) / df
             vi &= (x >= 0) & (x < len(fr) - 1)
             j = np.where(vi)[0]
@@ -368,7 +453,7 @@ def identifier(cat, fr, tr, norm, t0, rx, args, bavard=True):
                     sc_fin, tau_fin, F_fin = sc, tau, Fi
         if F_fin is not None:
             F = F.copy(); F[a_best] = F_fin
-            valide = valide.copy(); valide[a_best] = ~np.isnan(F_fin) & (np.abs(F_fin) <= FENETRE_HZ - 500) & (np.abs(F_fin) > 25)
+            valide = valide.copy(); valide[a_best] = ~np.isnan(F_fin) & (np.abs(F_fin) <= f_lim) & (np.abs(F_fin) > 25)
         # décalages nuls dont la courbe sort entièrement de la fenêtre : aucune valeur, on les ignore
         fini = np.isfinite(scores[1:]).any(axis=1)
         nulls = np.nanmax(scores[1:][fini], axis=1) if fini.any() else np.array([])
@@ -376,19 +461,22 @@ def identifier(cat, fr, tr, norm, t0, rx, args, bavard=True):
             continue
         mu, sd = float(nulls.mean()), float(max(nulls.std(ddof=1), 1e-3))
         z = (meilleur - mu) / sd
-        # trace retenue : tranches où le pixel le long de la courbe dépasse nettement le fond
+        # trace retenue : tranches du tronçon où le pixel le long de la courbe dépasse nettement le fond
         K = np.round((F[a_best] - fr[0]) / df)
-        ok = valide[a_best] & (K >= 0) & (K < len(fr))
+        ok = valide[a_best] & (K >= 0) & (K < len(fr)) & dans
         j = np.where(ok)[0]
         forts = j[10 * np.log10(Pm[K[j].astype(int), j]) >= args.seuil]
         o = cat.objets[i_cat]
         jj = ~np.isnan(fd_q)
         resultats.append(dict(i=i_cat, nom=o["nom"], norad=o["norad"], type=o["type"], rcs=o["rcs"],
                               idet=idet, tau=float(tau_fin), z=float(z), score=float(meilleur), mu=mu, sd=sd,
-                              valide=valide[a_best],
-                              ntr=int(len(j)), forts=forts, F=F[a_best],
+                              valide=valide[a_best] & dans, seg=(float(tr[j0]), float(tr[j1])),
+                              ntr=int(len(j)), forts=forts, F=F[a_best].copy(),   # copie : une vue garderait toute la matrice (65 × n)
                               dT=float(np.nanmin(NT[n][jj])), dR=float(np.nanmin(NR[n][jj])),
                               age=float(t_abs[0] / 86400 + 2440587.5 - cat.epoque_jd[i_cat])))
+    if bavard:
+        print(f"Corrélation de {len(cands)} objet(s) : {time.time() - t_corr:.0f} s"
+              + (f" (tronçon de {troncon:g} s)" if L else " (courbes entières)"))
 
     # attribution exclusive : les objets sont acceptés par z décroissant ; les pixels d'un objet accepté
     # sont retirés, et le score des suivants est recalculé sur ce qui reste. Un objet dont le score ne
@@ -400,40 +488,66 @@ def identifier(cat, fr, tr, norm, t0, rx, args, bavard=True):
     acceptes = []
     for r in resultats:
         r["identifie"] = False
-        if r["z"] < args.z_min or len(r["forts"]) < args.min_forts:
+        r["candidat"] = False
+        if r["z"] < args.z_min:
             continue
         K = np.round((r["F"] - fr[0]) / df)
         ok = r["valide"] & (K >= 0) & (K < len(fr)) & ~np.isnan(r["F"])
         j = np.where(ok)[0]
         k = K[j].astype(int)
         z_reste = (Pr[k, j].mean() - r["mu"]) / r["sd"] if len(j) else -np.inf
-        if z_reste < args.z_min:
-            pris = proprio[k, j]
-            pris = pris[pris >= 0]
-            if len(pris):
-                r["confondu"] = acceptes[np.bincount(pris).argmax()]["nom"]
+        r["z_reste"] = float(z_reste)
+        pris = proprio[k, j]
+        pris = pris[pris >= 0]
+        if z_reste < args.z_min and len(pris):
+            # le score tenait (en partie) aux pixels d'un objet déjà identifié
+            r["confondu"] = acceptes[np.bincount(pris).argmax()]["nom"]
+            continue
+        if z_reste < args.z_min or len(r["forts"]) < args.min_forts:
+            # énergie nettement au-dessus des leurres au recalage grossier, mais écho trop faible ou trop fragile
+            # (score retombé sur la courbe affinée, ou trop peu de tranches fortes) : détection probable, non
+            # confirmée. Ses pixels ne sont pas retirés : rien ne lui est attribué.
+            r["candidat"] = True
             continue
         r["identifie"] = True
-        r["z_reste"] = float(z_reste)
         for d in range(-2, 3):
             kk = np.clip(k + d, 0, len(fr) - 1)
             Pr[kk, j] = fond
             proprio[kk, j] = len(acceptes)
         acceptes.append(r)
 
+    # mémoire : seules les courbes des objets identifiés, candidats et des GARDE_COURBES meilleurs z sont gardées
+    # (affichage, tracé) ; les autres ne servent plus
+    for rang, r in enumerate(resultats):
+        if rang >= GARDE_COURBES and not r["identifie"] and not r["candidat"]:
+            r.pop("F", None)
+            r.pop("valide", None)
     return resultats
 
 
 def afficher(resultats, args):
     print("\nObjet                     NORAD  Type         RCS     Dist. GRAVES/RX    Indice   Âge TLE  Recalage   z     Verdict")
-    for r in sorted(resultats, key=lambda r: (-r["identifie"], -r["z"]))[: args.lignes]:
-        verdict = "ÉCHO IDENTIFIÉ" if r["identifie"] else (f"confondu avec {r['confondu']}" if r.get("confondu") else "-")
+    ordre = sorted(resultats, key=lambda r: (-r["identifie"], -r.get("candidat", False), -r["z"]))
+    for r in ordre[: args.lignes]:
+        if r["identifie"]:
+            verdict = f"ÉCHO IDENTIFIÉ (t = {r['seg'][0]:.0f}–{r['seg'][1]:.0f} s)"
+        elif r.get("candidat"):
+            verdict = f"CANDIDAT (écho vers t = {r['seg'][0]:.0f}–{r['seg'][1]:.0f} s)"
+        elif r.get("confondu"):
+            verdict = f"confondu avec {r['confondu']}"
+        else:
+            verdict = "-"
         print(f"{r['nom'][:25]:<25} {r['norad']:6d}  {r['type'][:11]:<11}  {r['rcs'][:6]:<6} "
               f"{r['dT']:6.0f} / {r['dR']:5.0f} km  {r['idet']:+6.1f} dB  {r['age']:5.1f} j  {r['tau']:+5.2f} s  "
               f"{r['z']:5.1f}  {verdict}")
     n = sum(r["identifie"] for r in resultats)
-    print(f"\n{n} satellite(s) identifié(s) sur {len(resultats)} objet(s) dont la courbe traverse la fenêtre.")
+    nc = sum(r.get("candidat", False) for r in resultats)
+    print(f"\n{n} satellite(s) identifié(s), {nc} candidat(s), sur {len(resultats)} objet(s) dont la courbe traverse "
+          "la fenêtre.")
     print("Recalage = décalage temporel entre la prévision TLE et l'écho observé ; z = écart aux courbes leurres (σ).")
+    if nc:
+        print(f"CANDIDAT = z ≥ {args.z_min:g} mais écho trop faible pour être confirmé : à vérifier sur l'image "
+              "(courbe pointillée orange, 120 Hz à droite de l'écho ; trait plein = tronçon où l'écho a été trouvé).")
 
 
 def tracer(png, fr, tr, norm, resultats, debut, args):
@@ -452,16 +566,25 @@ def tracer(png, fr, tr, norm, resultats, debut, args):
         if r["identifie"]:
             col = couleurs[k % len(couleurs)]; k += 1
             ax.plot(r["F"] + 120, tr, color=col, lw=1.3, linestyle=(0, (4, 5)))
-            ok = np.where(~np.isnan(r["F"]))[0]
+            ok = np.where(~np.isnan(r["F"]) & (tr >= r["seg"][0]) & (tr <= r["seg"][1]))[0]
             j = ok[len(ok) // 3]
             ax.annotate(f"{r['nom']} ({r['norad']})  τ={r['tau']:+.1f} s", (r["F"][j] + 150, tr[j]), color=col,
                         fontsize=10, fontweight="bold", bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6, lw=0))
-        elif args.tous and r["z"] > 0:
+        elif r.get("candidat"):
+            col = "#ffa64d"
+            ax.plot(r["F"] + 120, tr, color=col, lw=1.0, linestyle=(0, (1, 3)))
+            seg = (tr >= r["seg"][0]) & (tr <= r["seg"][1])
+            ax.plot(np.where(seg, r["F"] + 120, np.nan), tr, color=col, lw=2.0, alpha=0.8)
+            ok = np.where(~np.isnan(r["F"]) & seg)[0]
+            j = ok[len(ok) // 2]
+            ax.annotate(f"{r['nom']} ? z={r['z']:.1f} τ={r['tau']:+.1f} s", (r["F"][j] + 150, tr[j]), color=col,
+                        fontsize=9, bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6, lw=0))
+        elif args.tous and r["z"] > 0 and "F" in r:      # les GARDE_COURBES meilleurs z seulement
             ax.plot(r["F"] + 120, tr, ":", color="0.7", lw=0.7)
     ax.set_xlabel("Doppler bistatique (Hz) — 0 = porteuse directe GRAVES")
     ax.set_ylabel(f"Temps (s) depuis {debut:%H:%M:%S} UTC")
-    ax.set_title(f"GRAVES 143,050 MHz — {debut:%Y-%m-%d %H:%M:%S} UTC — satellites identifiés\n"
-                 f"(tirets = Doppler prévu recalé, tracé 120 Hz à droite de l'écho)")
+    ax.set_title(f"GRAVES 143,050 MHz — {debut:%Y-%m-%d %H:%M:%S} UTC — satellites identifiés (tirets) et "
+                 f"candidats (pointillés orange)\n(courbes = Doppler prévu recalé, tracé 120 Hz à droite de l'écho)")
     fig.colorbar(im, ax=ax, label="dB au-dessus du fond", pad=0.01, shrink=0.8)
     fig.savefig(png, dpi=100)
     plt.close(fig)
@@ -476,12 +599,17 @@ def mode_passages(args):
     pas = 20.0
     tq = np.arange(t0, t1, pas)
     passages = []
+    n_bas = 0
     t_calc = time.time()
+    fen = args.fenetre - MARGE_BORD_HZ
     for d in range(0, len(cat), 2000):
         sous = cat.sous_ensemble(list(range(d, min(d + 2000, len(cat)))))
         R, V = propager(sous, tq)
         fd, elT, elR, nT, nR = geometrie(R, V, rx)
-        ok = (elT > 0) & (elR > 0) & (np.abs(fd) <= FENETRE_HZ)
+        haut = altitude_km(R) > ALT_MIN_KM
+        ok = (elT > 0) & (elR > 0) & (np.abs(fd) <= fen)
+        n_bas += int((ok & ~haut).any(axis=1).sum())
+        ok &= haut
         for i in np.where(ok.any(axis=1))[0]:
             j = np.where(ok[i])[0]
             ruptures = np.where(np.diff(j) > 1)[0]
@@ -493,8 +621,10 @@ def mode_passages(args):
                                      dT=nT[i, jj].min(), dR=nR[i, jj].min(),
                                      idet=indice_detectabilite(o, nT[i, jj].min(), nR[i, jj].min())))
     passages.sort(key=lambda p: -p["idet"])
-    print(f"{len(passages)} passages dans la fenêtre Doppler ±{FENETRE_HZ/1000:.1f} kHz sur {args.heures:g} h "
+    print(f"{len(passages)} passages dans la fenêtre Doppler ±{fen/1000:.1f} kHz sur {args.heures:g} h "
           f"(calcul {time.time() - t_calc:.0f} s). Les {args.lignes} plus favorables :")
+    if n_bas:
+        print(f"({n_bas} objet(s) écarté(s) : orbite calculée sous {ALT_MIN_KM:.0f} km)")
     print("Début (UTC)          Durée   Objet                     NORAD  Type         RCS     Doppler (Hz)       GRAVES/RX (km)  Indice")
     for p in sorted(passages[: args.lignes], key=lambda p: p["t"]):
         print(f"{datetime.fromtimestamp(p['t'], timezone.utc):%Y-%m-%d %H:%M:%S}  {p['duree']:4.0f} s  {p['nom'][:25]:<25} "
@@ -514,6 +644,9 @@ def main():
         q.add_argument("--lon", type=float, default=None)
         q.add_argument("--alt", type=float, default=None)
         q.add_argument("--lignes", type=int, default=30, help="nombre de lignes affichées")
+        q.add_argument("--fenetre", type=float, default=FENETRE_HZ,
+                       help=f"demi-largeur de la fenêtre Doppler (Hz, défaut {FENETRE_HZ:.0f}) ; courbes évaluées "
+                            f"jusqu'à fenêtre − {MARGE_BORD_HZ:.0f} Hz")
 
     c = sp.add_parser("catalogue", help="télécharger les éléments orbitaux")
     c.add_argument("--source", choices=["spacetrack", "celestrak"], default="spacetrack")
@@ -530,16 +663,24 @@ def main():
     s.add_argument("iq")
     s.add_argument("--resolution", type=float, default=8.0, help="résolution de la cascade rapide (Hz)")
     s.add_argument("--tau-max", dest="tau_max", type=float, default=8.0, help="recalage temporel cherché (± s)")
-    s.add_argument("--max", type=int, default=400, help="nombre max de candidats testés (les plus détectables)")
+    s.add_argument("--max", type=int, default=MAX_TESTES,
+                   help=f"nombre max d'objets testés, les plus détectables (défaut {MAX_TESTES})")
+    s.add_argument("--troncon", type=float, default=TRONCON_S,
+                   help=f"durée (s) du tronçon de courbe sur lequel l'écho est cherché (défaut {TRONCON_S:g} ; "
+                        "0 = courbe entière, comme avant)")
     s.add_argument("--min-tranches", dest="min_tranches", type=int, default=15)
+    s.add_argument("--plafond", type=float, default=PLAFOND_DB,
+                   help=f"plafond (dB) d'une case de la cascade dans le score (défaut {PLAFOND_DB:g}) : empêche un écho "
+                        "d'avion très fort, croisé brièvement, de faire « identifier » un satellite")
     s.add_argument("--min-forts", dest="min_forts", type=int, default=4,
-                   help="nombre minimal de tranches où l'écho dépasse le seuil")
+                   help="nombre minimal de tranches où l'écho dépasse le seuil (sinon : CANDIDAT)")
     s.add_argument("--seuil", type=float, default=8.0, help="seuil (dB) d'une tranche « forte »")
     s.add_argument("--z-min", dest="z_min", type=float, default=6.0)
     s.add_argument("--porteuse", type=float, default=None)
     s.add_argument("--decalage-temps", dest="decalage_temps", type=float, default=0.0)
     s.add_argument("--sans-derive", dest="sans_derive", action="store_true")
-    s.add_argument("--tous", action="store_true", help="tracer aussi les candidats non identifiés")
+    s.add_argument("--tous", action="store_true",
+                   help=f"tracer aussi les courbes des {GARDE_COURBES} meilleurs objets non retenus")
     args = p.parse_args()
     {"catalogue": mode_catalogue, "passages": mode_passages, "superpose": mode_superpose}[args.mode](args)
 
