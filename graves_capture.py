@@ -24,6 +24,18 @@ Options gain : --lna N (état LNA, 0 = gain max, défaut 2) --ifgr N (réduction
 Attention : gain maximal (--lna 0) sans filtre FM, les émetteurs FM saturent le RSPdx et les échos disparaissent.
 L'AGC est toujours désactivée (elle déformerait les échos).
 
+Référence GPS (graves_gps.py, fichier graves_gps.json de moins de 24 h) : elle fournit la position du récepteur
+(sauf --lat/--lon) et la position attendue de la porteuse GRAVES (−143,05 MHz × ε de l'oscillateur du RSPdx),
+point de départ de sa recherche (sauf --porteuse). --sans-gps pour l'ignorer.
+La porteuse est alors cherchée à ±40 Hz de cette prévision (±15 Hz avec --porteuse) : en mode GPS (1 575 MHz,
+2 MS/s), le RSPdx n'est pas à la même température qu'en mode GRAVES, et son oscillateur diffère d'environ
+0,1 ppm, soit une vingtaine de Hz à 143 MHz.
+
+Interruptions du flux : si le RSPdx cesse d'envoyer des échantillons (délai dépassé, débordement USB, ou perte
+silencieuse détectée par l'horloge du PC), la durée manquante est mesurée une seconde après la reprise et
+remplacée par des zéros : la datation de la suite de la capture reste juste. Les trous sont listés dans le
+.json de la capture (champ « trous »).
+
 Dépendances : SoapySDR + SoapySDRPlay3 (apt/compilation), numpy, scipy, matplotlib.
 Fermer SDRconnect avant de lancer : un seul programme peut ouvrir le RSPdx.
 """
@@ -36,6 +48,13 @@ import numpy as np
 from scipy import signal
 
 F_GRAVES = 143.050e6
+F_GPS = "graves_gps.json"          # référence écrite par graves_gps.py
+AGE_MAX_GPS_H = 24.0               # au-delà, la référence est ignorée (antenne déplacée, oscillateur à une autre température)
+ZONE_PORTEUSE_HZ = 15.0            # recherche de la porteuse autour de --porteuse
+ZONE_PORTEUSE_GPS_HZ = 40.0        # … autour de la prévision GPS (écart thermique GPS / GRAVES)
+SEUIL_TROU_S = 0.25                # trou du flux comblé par des zéros au-delà de cette durée
+VERIF_PERTE_S = 1.0                # sans incident signalé : retard de plus de 1 s sur l'horloge du PC = perte silencieuse
+ATTENTE_REPRISE_S = 1.0            # après une interruption, on attend 1 s de données avant de mesurer le trou
 
 
 # --------------------------------------------------------------------------- matériel
@@ -121,26 +140,74 @@ def capturer(args, traiter_bloc):
                 traiter_bloc.apercu(buf[: sr.ret].copy(), fs)       # visible en direct, non enregistré
     n_tot, n_vise, debordements = 0, args.duree * fs, 0              # durée infinie possible (--live)
     args.etat = "en direct" if args.live else "enregistrement"
+    args.trous = []
     t0 = time.time()
+    t_mono0 = None                 # instant (horloge monotone du PC) du 1er échantillon enregistré
+    incident = False               # délai dépassé ou débordement depuis le dernier bloc reçu
+    attente, n_attente, t_verif = None, 0, 0.0   # blocs retenus après une interruption, le temps de mesurer le trou
+
+    def vider_attente(maintenant):
+        """Mesure le trou (retard du nombre d'échantillons sur l'horloge du PC), le comble par des zéros,
+        puis transmet les blocs retenus : chaque échantillon garde ainsi sa vraie date."""
+        nonlocal attente, n_attente, n_tot, incident
+        manque = int(round((maintenant - t_mono0) * fs)) - (n_tot + n_attente)
+        if manque > SEUIL_TROU_S * fs:
+            manque = int(min(manque, max(n_vise - n_tot, 0)) if np.isfinite(n_vise) else manque)
+            print(f"  flux interrompu vers {n_tot / fs:.1f} s : {manque / fs:.2f} s d'échantillons manquants, "
+                  f"remplacés par des zéros (la datation de la suite reste juste)")
+            args.trous.append((round(n_tot / fs, 3), round(manque / fs, 3)))
+            reste = manque
+            while reste > 0:
+                m = min(reste, 65536)
+                traiter_bloc(np.zeros(m, np.complex64), fs)
+                reste -= m
+            n_tot += manque
+        for b in attente:
+            traiter_bloc(b, fs)
+            n_tot += len(b)
+        attente, n_attente, incident = None, 0, False
+
     try:
         while n_tot < n_vise and not args.arret.is_set():
             sr = dev.readStream(st, [buf], len(buf), timeoutUs=1_000_000)
             if sr.ret > 0:
-                if n_tot == 0:
+                maintenant = time.monotonic()
+                bloc = buf[: sr.ret].copy()
+                if t_mono0 is None:
                     args.t_premier = time.time() - sr.ret / fs   # horodatage du 1er échantillon
-                traiter_bloc(buf[: sr.ret].copy(), fs)
+                    t_mono0 = maintenant - sr.ret / fs
+                    traiter_bloc(bloc, fs)
+                    n_tot += sr.ret
+                    continue
+                if attente is None and not incident and \
+                        (maintenant - t_mono0) * fs - (n_tot + sr.ret) > VERIF_PERTE_S * fs:
+                    incident = True                    # perte silencieuse : le pilote n'a rien signalé
+                if attente is None and incident:
+                    attente, n_attente, t_verif = [], 0, maintenant + ATTENTE_REPRISE_S
+                if attente is not None:
+                    attente.append(bloc)
+                    n_attente += sr.ret
+                    if maintenant >= t_verif:
+                        vider_attente(maintenant)
+                    continue
+                traiter_bloc(bloc, fs)
                 n_tot += sr.ret
             elif sr.ret == SoapySDR.SOAPY_SDR_OVERFLOW:
                 debordements += 1
                 args.debordements = debordements
+                incident = True
             elif sr.ret == SoapySDR.SOAPY_SDR_TIMEOUT:
                 print("  délai dépassé (pas de données)")
+                incident = True
     except KeyboardInterrupt:
         print("Interrompu.")
     finally:
+        if attente is not None and t_mono0 is not None:
+            vider_attente(time.monotonic())
         dev.deactivateStream(st)
         dev.closeStream(st)
-    print(f"Capturé {n_tot/fs:.1f} s en {time.time()-t0:.1f} s, débordements USB : {debordements}")
+    trous = f", {len(args.trous)} trou(s) comblé(s) ({sum(d for _, d in args.trous):.1f} s)" if args.trous else ""
+    print(f"Capturé {n_tot/fs:.1f} s en {time.time()-t0:.1f} s, débordements USB : {debordements}{trous}")
     args.etat = "terminé"
     return fs
 
@@ -250,10 +317,12 @@ class Afficheur:
     graduations et légende sont dessinés une fois, seuls les images, repères et titre sont redessinés."""
 
     def __init__(self, titre, duree_fine=300.0, duree_rapide=60.0, dyn_db=20.0, analyse=None, horloge=time.time,
-                 plage_fine=(-300.0, 400.0), taille=(1920, 1080), ips=5.0, blit=True, porteuse=None):
+                 plage_fine=(-300.0, 400.0), taille=(1920, 1080), ips=5.0, blit=True, porteuse=None,
+                 zone_porteuse=ZONE_PORTEUSE_HZ):
         self.taille, self.blit_permis = taille, blit
         self.porteuse_memo = porteuse                 # dernière position connue de la porteuse directe (Hz)
-        self.porteuse_ref = porteuse                  # position donnée par --porteuse : zone de recherche
+        self.porteuse_ref = porteuse                  # position donnée par --porteuse (ou prévue par le GPS)
+        self.zone_porteuse = float(zone_porteuse)     # demi-largeur de la zone de recherche autour de porteuse_ref
         self.titre, self.duree_fine, self.duree_rapide, self.dyn = titre, duree_fine, duree_rapide, dyn_db
         self.analyse, self.horloge = analyse, horloge
         # partie affichée de la cascade fine ; le calcul (porteuse, corrélation ADS-B) reste sur ±400 Hz
@@ -310,23 +379,44 @@ class Afficheur:
             return self._porteuse_cache              # recalcul toutes les 2 lignes fines (~2 s)
         self._porteuse_n = self.n_lignes_fin
         ok = ~np.isnan(self.t_fin)
-        if ok.sum() < 30:                              # ~30 s : trop peu de lignes pour une médiane fiable
+        res = None
+        if getattr(self, "_porteuse_vue", False) and ok.sum() >= 15:
+            # SUIVI : une fois accrochée, la porteuse est suivie sur les ~40 dernières secondes, à ±6 Hz de sa
+            # dernière position. L'oscillateur du RSPdx peut dériver de 15 Hz en 5 min (température) : la médiane
+            # sur 5 min, robuste pour l'accrochage, aurait alors plusieurs hertz de retard — courbes ADS-B
+            # décalées, et porteuse sortie de la zone protégée du détecteur de météores (faux « M »).
+            recent = np.flatnonzero(ok)[:40]           # lignes les plus récentes en tête
+            med_r = np.median(self.img_fin[recent], axis=0)
+            pres = np.abs(self.f_fin - self.porteuse_memo) <= 6
+            k = int(np.argmax(np.where(pres, med_r, -np.inf)))
+            autour = np.abs(self.f_fin - self.porteuse_memo) <= 30
+            if med_r[k] >= 1.5 and med_r[k] - np.median(med_r[autour]) >= 1.2:
+                self.porteuse_memo = float(self.f_fin[k])
+                res = (self.porteuse_memo, f" — porteuse GRAVES à {self.porteuse_memo:+.1f} Hz (+{med_r[k]:.1f} dB, suivie)")
+        if res is not None:
+            pass
+        elif ok.sum() < 30:                            # ~30 s : trop peu de lignes pour une médiane fiable
             res = ((self.porteuse_memo or 0.0), "")
         else:
             med = np.median(self.img_fin[ok], axis=0)  # dB au-dessus du fond, médiane temporelle par case
-            if self.porteuse_ref is not None:          # --porteuse : on ne la cherche qu'autour (±15 Hz,
-                zone = np.abs(self.f_fin - self.porteuse_ref) <= 15   # dérive de mise en température comprise)
+            if self.porteuse_ref is not None:          # --porteuse ou prévision GPS : on ne la cherche qu'autour
+                zone = np.abs(self.f_fin - self.porteuse_ref) <= self.zone_porteuse
             else:
                 zone = np.abs(self.f_fin) <= 200
             k = int(np.argmax(np.where(zone, med, -np.inf)))
             # bruit seul : médiane par case ≈ 0 dB, à ±0,4 dB près. Sur ±200 Hz (800 cases), un pic de
             # bruit peut atteindre ~1,5 dB : seuil 3 dB. Avec --porteuse, la zone ne fait que 60 cases :
             # un pic de 1,5 dB qui dépasse nettement ses voisines suffit — c'est le cas de la porteuse
-            # faible de la Yagi relevée, qui continue de dériver lentement avec la température.
-            seuil = 1.5 if self.porteuse_ref is not None else 3.0
+            # faible de la Yagi relevée, qui continue de dériver lentement avec la température. Zone de
+            # ±40 Hz (prévision GPS, 160 cases) : seuil intermédiaire de 2 dB.
+            if self.porteuse_ref is None:
+                seuil = 3.0
+            else:
+                seuil = 1.5 if self.zone_porteuse <= 20 else 2.0
             relief = med[k] - np.median(med[zone])
             if med[k] >= seuil and relief >= 1.2:
                 self.porteuse_memo = float(self.f_fin[k])
+                self._porteuse_vue = True
                 faible = " faible" if med[k] < 3.0 else ""
                 res = (self.porteuse_memo,
                        f" — porteuse GRAVES à {self.porteuse_memo:+.1f} Hz (+{med[k]:.1f} dB{faible})")
@@ -591,8 +681,9 @@ def creer_parseur(description=__doc__):
     p.add_argument("--analyse", action="store_true",
                    help="avec --direct : identifier en direct avions (journal ADS-B), satellites (catalogue) et météores")
     p.add_argument("--porteuse", type=float, default=None, metavar="HZ",
-                   help="position connue de la porteuse directe (Hz, ex. 64), utilisée tant qu'elle n'est pas "
-                        "détectée (Yagi relevée : porteuse faible). Sinon : dernière position détectée")
+                   help=f"position connue de la porteuse directe (Hz, ex. 86), cherchée à ±{ZONE_PORTEUSE_HZ:.0f} Hz "
+                        f"autour. Par défaut : prévision GPS (cherchée à ±{ZONE_PORTEUSE_GPS_HZ:.0f} Hz), sinon "
+                        "recherche sur ±200 Hz")
     p.add_argument("--plage-fine", dest="plage_fine", type=float, nargs=2, default=[-300.0, 400.0],
                    metavar=("MIN", "MAX"),
                    help="décalages affichés dans la cascade fine (en direct et PNG _fin), en Hz "
@@ -613,22 +704,34 @@ def creer_parseur(description=__doc__):
     p.add_argument("--live", action="store_true",
                    help="cascade en direct uniquement : aucun fichier écrit (ni IQ, ni PNG), rien n'est gardé en mémoire ; "
                         "tourne jusqu'à fermeture de la fenêtre ou Ctrl-C (sauf --duree). Combinable avec --analyse")
-    try:
-        import graves_adsb as _a
-        st, nom_st = _a.STATION, _a.NOM_STATION
-    except Exception:
-        st, nom_st = (48.8566, 2.3522, 35.0), "Paris (exemple)"
-    p.add_argument("--lat", type=float, default=st[0], help=f"latitude du récepteur (défaut : {nom_st})")
-    p.add_argument("--lon", type=float, default=st[1], help="longitude du récepteur")
-    p.add_argument("--alt", type=float, default=st[2], help="altitude de l'antenne (m)")
+    p.add_argument("--lat", type=float, default=None,
+                   help="latitude du récepteur (défaut : référence GPS de moins de 24 h, sinon station.ini, sinon Paris, exemple)")
+    p.add_argument("--lon", type=float, default=None, help="longitude du récepteur")
+    p.add_argument("--alt", type=float, default=None, help="hauteur de l'antenne (m)")
+    p.add_argument("--gps", default=F_GPS, metavar="FICHIER",
+                   help=f"référence écrite par graves_gps.py (défaut {F_GPS}) : position, oscillateur, horloge du PC")
+    p.add_argument("--sans-gps", dest="sans_gps", action="store_true", help="ignorer la référence GPS")
     p.add_argument("--journal", default=".", help="dossier du journal ADS-B (adsb_AAAAMMJJ.jsonl)")
     p.add_argument("--catalogues", default=".", help="dossier des catalogues orbitaux (catalogue_AAAAMMJJ.json)")
     p.add_argument("--prefixe", default="graves", help="préfixe des fichiers de sortie")
     return p
 
 
+def reference_gps(chemin=F_GPS):
+    """Dernière référence de graves_gps.py : (dict, âge en heures), ou (None, None)."""
+    import json
+    try:
+        with open(chemin) as f:
+            ref = json.load(f)
+        age = (time.time() - datetime.fromisoformat(ref["mesure_utc"]).timestamp()) / 3600
+        return ref, age
+    except Exception:
+        return None, None
+
+
 def preparer(args):
-    """Cohérence des options après lecture de la ligne de commande."""
+    """Cohérence des options après lecture de la ligne de commande ; position du récepteur et position attendue
+    de la porteuse d'après la référence GPS (graves_gps.py) quand elle existe et date de moins de 24 h."""
     if args.analyse or args.live:
         args.direct = True
     if args.duree is None:
@@ -636,7 +739,68 @@ def preparer(args):
     if args.live and args.iq:
         print("--iq ignoré : le mode --live n'écrit aucun fichier")
         args.iq = False
-    print(f"Récepteur : {args.lat:.4f} N, {args.lon:.4f} E, {args.alt:.0f} m")
+    args.zone_porteuse = ZONE_PORTEUSE_HZ
+    args.trous = []
+
+    ref, age = (None, None) if args.sans_gps else reference_gps(args.gps)
+    if ref is not None and age is not None and age > AGE_MAX_GPS_H:
+        print(f"Référence GPS {args.gps} vieille de {age:.0f} h : ignorée (relancer graves_gps.py pour la rafraîchir)")
+        ref = None
+    args.ref_gps = ref
+    quand = f"il y a {age:.1f} h" if ref is not None and age is not None and age >= 0 else ""
+
+    # position du récepteur : ligne de commande > GPS mesuré > station.ini > position d'exemple (Paris)
+    pos = (ref or {}).get("position") or {}
+    if args.lat is not None and args.lon is not None:
+        src = "ligne de commande"
+        if args.alt is None:
+            args.alt = 0.0
+    elif pos.get("mesuree"):
+        args.lat, args.lon = pos["lat"], pos["lon"]
+        if args.alt is None:
+            args.alt = pos["h_ellipsoide_m"]
+        sig = max([v for v in (pos.get("sigma_enu_m") or [])[:2] if v is not None] or [0.0])   # horizontale
+        # la position peut venir d'un calage plus ancien (les calages « heure seule » la conservent)
+        age_pos = age
+        if pos.get("mesure_position_utc"):
+            try:
+                age_pos = (time.time() - datetime.fromisoformat(pos["mesure_position_utc"]).timestamp()) / 3600
+            except ValueError:
+                pass
+        src = f"GPS mesurée il y a {age_pos:.1f} h" + (f", ±{sig:.0f} m" if sig else "")
+        if age_pos is not None and age_pos > AGE_MAX_GPS_H:
+            print(f"Attention : position GPS mesurée il y a {age_pos / 24:.1f} j — si l'antenne a été déplacée "
+                  "(terrain), refaire un calage complet (graves_gps.py, ≥ 4 satellites) ou donner --lat/--lon")
+    else:
+        try:
+            import graves_adsb as _a
+            st, src = _a.STATION, _a.NOM_STATION
+        except Exception:
+            st, src = (48.8566, 2.3522, 35.0), "Paris (exemple)"
+        args.lat = st[0] if args.lat is None else args.lat
+        args.lon = st[1] if args.lon is None else args.lon
+        args.alt = st[2] if args.alt is None else args.alt
+    args.source_rx = src
+    print(f"Récepteur : {args.lat:.5f} N, {args.lon:.5f} E, {args.alt:.0f} m ({src})")
+
+    # oscillateur : la porteuse GRAVES (143,050 MHz) apparaît à −f·ε ; sert de point de départ à sa recherche
+    osc = (ref or {}).get("oscillateur") or {}
+    if osc.get("epsilon") is not None:
+        prevue = -args.freq * osc["epsilon"]
+        a_graves = abs(args.freq - F_GRAVES) < 1e3
+        print(f"Oscillateur du RSPdx (GPS {quand}) : {osc['epsilon'] * 1e6:+.3f} ppm"
+              + (f" → porteuse GRAVES attendue vers {prevue:+.1f} Hz" if a_graves else
+                 f" → décalage {prevue:+.1f} Hz à {args.freq / 1e6:.3f} MHz"))
+        if args.porteuse is None and a_graves:
+            args.porteuse = round(prevue, 1)
+            args.zone_porteuse = ZONE_PORTEUSE_GPS_HZ
+            print(f"  porteuse cherchée à ±{ZONE_PORTEUSE_GPS_HZ:.0f} Hz de cette prévision (température du RSPdx "
+                  f"différente en mode GPS ; --porteuse HZ pour imposer la valeur observée, à ±{ZONE_PORTEUSE_HZ:.0f} Hz)")
+    hpc = (ref or {}).get("horloge_pc") or {}
+    if hpc.get("ecart_s") is not None:
+        e = hpc["ecart_s"]
+        print(f"Horloge du PC (GPS {quand}) : {e * 1e3:+.0f} ms par rapport à l'UTC"
+              + (" — ÉCART IMPORTANT : sudo python3 graves_gps.py --regler-horloge" if abs(e) > 1.0 else ""))
     return args
 
 
@@ -673,7 +837,8 @@ def main():
         titre = titre_direct(args)
         analyse = creer_analyse(args)
         aff = Afficheur(titre, analyse=analyse, plage_fine=args.plage_fine, taille=args.taille,
-                        ips=args.ips, blit=not args.sans_blit, porteuse=args.porteuse)
+                        ips=args.ips, blit=not args.sans_blit, porteuse=args.porteuse,
+                        zone_porteuse=args.zone_porteuse)
         dec.ecouteur = aff.recevoir
         fil = threading.Thread(target=acquisition, args=(args, dec), daemon=True)
         t_dep = time.time()
@@ -718,6 +883,16 @@ def main():
     sauvegarder(args, dec)
 
 
+def _resume_gps(ref):
+    """Extrait de la référence GPS gardé avec chaque capture (analyses hors ligne)."""
+    if not ref:
+        return None
+    osc, pos = ref.get("oscillateur") or {}, ref.get("position") or {}
+    return dict(mesure_utc=ref.get("mesure_utc"), epsilon_ppm=osc.get("epsilon_ppm"),
+                correction_hz_graves=osc.get("correction_hz_graves"), position_mesuree=pos.get("mesuree"),
+                horloge_pc_ecart_s=(ref.get("horloge_pc") or {}).get("ecart_s"))
+
+
 def sauvegarder(args, dec):
     """Fin d'une capture enregistrée : IQ décimé (--iq), cascades PNG et relevé des raies."""
     iq, fs_out = dec.resultat()
@@ -731,9 +906,11 @@ def sauvegarder(args, dec):
         np.save(base + ".npy", iq)
         with open(base + ".json", "w") as fj:
             json.dump(dict(t0_unix=args.t_premier, t0_utc=debut.isoformat(), fs=fs_out,
-                           rx=[args.lat, args.lon, args.alt],
+                           rx=[args.lat, args.lon, args.alt], source_rx=getattr(args, "source_rx", None),
+                           reference_gps=_resume_gps(getattr(args, "ref_gps", None)),
                            freq_hz=args.freq, antenne=args.antenne, lna=args.lna, ifgr=args.ifgr,
-                           notch_fm=args.notch_fm, simulation=args.simulation), fj, indent=1)
+                           notch_fm=args.notch_fm, simulation=args.simulation,
+                           trous=[dict(debut_s=a, duree_s=d) for a, d in getattr(args, "trous", [])]), fj, indent=1)
         print(f"IQ sauvegardé : {base}.npy (+ .json)")
 
     # cascade large (satellites, météores) et cascade fine (avions, porteuse)

@@ -7,9 +7,12 @@ Deux modes :
   1) journal : enregistre en continu les positions ADS-B (readsb local et/ou API adsb.fi)
      python3 graves_adsb.py journal                              # readsb local seul
      python3 graves_adsb.py journal --source local --source adsbfi   # + avions lointains et MLAT (adsb.fi)
-     python3 graves_adsb.py journal --source adsbfi              # sur le terrain, sans récepteur ADS-B local
+     python3 graves_adsb.py journal --source adsbfi              # adsb.fi seul, réglages par défaut
+     python3 graves_adsb.py journal --terrain                    # sur le terrain (connexion mobile) :
+                                                                 # adsb.fi, gzip, toutes les 3 s, 200 NM
          → adsb_AAAAMMJJ.jsonl (un fichier par jour UTC), dans le dossier courant
-     À laisser tourner dans un terminal pendant les captures.
+     À laisser tourner dans un terminal pendant les captures. Le bilan affiché chaque minute donne
+     le volume de données reçu (Mo, et Mo/h en moyenne).
 
   2) superpose : pour une capture enregistrée avec --iq, calcule le Doppler
      bistatique GRAVES → avion → récepteur de chaque avion ADS-B, mesure si un
@@ -125,36 +128,70 @@ ADSBFI_URL = "https://opendata.adsb.fi/api/v3/lat/{lat:.4f}/lon/{lon:.4f}/dist/{
 ADSBFI_MENTION = "Données ADS-B complémentaires : adsb.fi (https://adsb.fi)"
 CENTRE_DEFAUT = GRAVES[:2]          # zone éclairée par GRAVES
 
+# réglages du journal : par défaut (connexion fixe) et sur le terrain (connexion mobile, --terrain)
+RAYON_MAISON_NM, PERIODE_MAISON_S = 250.0, 2.0
+RAYON_TERRAIN_NM, PERIODE_TERRAIN_S = 200.0, 3.0
 
-def lire_aircraft_json(source, timeout=5):
-    """Lit un aircraft.json readsb (fichier ou URL) ou une réponse compatible ADSBexchange v2.
-    Retourne (instant de la réponse en s Unix, liste des avions)."""
+
+def _telecharger(source, timeout=5, compresse=False):
+    """Lit un document JSON (fichier ou URL). Retourne (document, octets reçus sur le réseau, réponse gzip ?).
+    compresse=True : demande au serveur une réponse gzip (Accept-Encoding) ; urllib ne décompresse pas
+    lui-même, on le fait ici. Le JSON des avions, très répétitif, se compresse d'un facteur ~6 à 10."""
     if source.startswith("http"):
         import urllib.request
-        req = urllib.request.Request(source, headers={"User-Agent": "graves-radar-amateur/1.0"})
+        entetes = {"User-Agent": "graves-radar-amateur/1.0"}
+        if compresse:
+            entetes["Accept-Encoding"] = "gzip"
+        req = urllib.request.Request(source, headers=entetes)
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            d = json.load(r)
-    else:
-        with open(source) as f:
-            d = json.load(f)
+            brut = r.read()
+            gz = (r.headers.get("Content-Encoding") or "").strip().lower() == "gzip"
+        octets = len(brut)
+        if gz or brut[:2] == b"\x1f\x8b":
+            import gzip
+            brut = gzip.decompress(brut)
+            gz = True
+        return json.loads(brut), octets, gz
+    with open(source) as f:
+        return json.load(f), 0, False
+
+
+def _extraire(d):
     now = d.get("now", time.time())
     if now > 1e11:                    # ADSBexchange v2 : millisecondes
         now /= 1000.0
-    return float(now), d.get("aircraft", d.get("ac", [] )) or []
+    return float(now), d.get("aircraft", d.get("ac", [])) or []
+
+
+def lire_aircraft_json(source, timeout=5, compresse=False):
+    """Lit un aircraft.json readsb (fichier ou URL) ou une réponse compatible ADSBexchange v2.
+    Retourne (instant de la réponse en s Unix, liste des avions)."""
+    d, _, _ = _telecharger(source, timeout, compresse)
+    return _extraire(d)
 
 
 class Source:
     """Une source de positions : readsb local (1 s) ou API adsb.fi (période ≥ 1 s, recul en cas d'erreur)."""
 
-    def __init__(self, nom, url, periode):
-        self.nom, self.url, self.periode = nom, url, periode
+    def __init__(self, nom, url, periode, compresse=False):
+        self.nom, self.url, self.periode, self.compresse = nom, url, periode, compresse
         self.prochain, self.recul, self.n_avions, self.erreur = 0.0, 0.0, 0, ""
+        self.octets, self.n_requetes, self.gzip_verifie = 0, 0, False
 
     def interroger(self):
         if time.time() < self.prochain:
             return None
         try:
-            now, avions = lire_aircraft_json(self.url)
+            d, octets, gz = _telecharger(self.url, compresse=self.compresse)
+            now, avions = _extraire(d)
+            self.octets += octets
+            self.n_requetes += 1
+            if self.compresse and self.url.startswith("http") and not self.gzip_verifie:
+                self.gzip_verifie = True
+                print(f"  [{self.nom}] " + (f"réponse compressée (gzip) : {octets / 1000:.0f} ko pour "
+                                            f"{len(avions)} avions" if gz else
+                                            "le serveur n'a PAS compressé la réponse : volume non réduit "
+                                            "(rayon et période réduits restent actifs)"), flush=True)
             self.recul, self.erreur, self.n_avions = 0.0, "", len(avions)
             self.prochain = time.time() + self.periode
             return now, avions
@@ -170,15 +207,16 @@ class Source:
 
 def construire_sources(args):
     sources = []
+    compresse = bool(getattr(args, "terrain", False))
     for s in args.source:
         if s == "local":
-            sources.append(Source("local", args.local, 1.0))
+            sources.append(Source("local", args.local, 1.0, compresse))
         elif s == "adsbfi":
             url = (args.url_adsbfi or ADSBFI_URL).format(lat=args.centre[0], lon=args.centre[1],
                                                           nm=min(args.rayon_nm, 250))
-            sources.append(Source("adsbfi", url, max(1.0, args.periode_adsbfi)))
+            sources.append(Source("adsbfi", url, max(1.0, args.periode_adsbfi), compresse))
         else:
-            sources.append(Source(os.path.basename(s) or s, s, 1.0))
+            sources.append(Source(os.path.basename(s) or s, s, 1.0, compresse))
     return sources
 
 
@@ -187,8 +225,13 @@ def mode_journal(args):
     dernier = {}
     types = {}                                  # hex → type OACI (A320, B738…), mémorisé quelle que soit la source
     n_ecrits, n_par_src, t_affiche = 0, {}, 0
+    t_debut = time.time()
+    if args.terrain:
+        print(f"Mode terrain : compression gzip demandée, adsb.fi interrogé toutes les {args.periode_adsbfi:g} s "
+              f"sur {min(args.rayon_nm, 250):.0f} NM")
     print("Journal ADS-B → adsb_AAAAMMJJ.jsonl (Ctrl-C pour arrêter). Sources : " +
-          ", ".join(f"{s.nom} ({s.url}, toutes les {s.periode:g} s)" for s in sources))
+          ", ".join(f"{s.nom} ({s.url}, toutes les {s.periode:g} s{', gzip' if s.compresse else ''})"
+                    for s in sources))
     if any(s.nom == "adsbfi" for s in sources):
         print("  " + ADSBFI_MENTION + " — usage personnel non commercial, 1 requête/s maximum")
     while True:
@@ -224,11 +267,19 @@ def mode_journal(args):
                 f.write("\n".join(lignes) + "\n")
             n_ecrits += len(lignes)
         if time.time() - t_affiche > 60:
+            reseau = [s for s in sources if s.url.startswith("http") and s.n_requetes]
+            volume = ""
+            if reseau:
+                mo = sum(s.octets for s in reseau) / 1e6
+                heures = max(time.time() - t_debut, 1.0) / 3600
+                recu = f"{mo:.1f} Mo" if mo >= 1 else f"{mo * 1000:.0f} ko"
+                volume = f" — reçu {recu} (~{mo / heures:.0f} Mo/h)" if time.time() - t_debut > 30 else \
+                    f" — reçu {recu}"
             print(f"  {datetime.now(timezone.utc):%H:%M:%S} UTC — " +
                   ", ".join(f"{s.nom} : {s.n_avions} avions{' (' + s.erreur + ')' if s.erreur else ''}"
                             for s in sources) +
                   f" — {n_ecrits} positions enregistrées (" +
-                  ", ".join(f"{k} {v}" for k, v in n_par_src.items()) + ")", flush=True)
+                  ", ".join(f"{k} {v}" for k, v in n_par_src.items()) + ")" + volume, flush=True)
             t_affiche = time.time()
         time.sleep(0.5)
 
@@ -295,7 +346,8 @@ def courbe_predite(piste, temps_abs, rx):
     _, elR = az_el(rx, lat, lon, alt)
     elT = elT + np.degrees(dT / (8 * 6371.0))
     elR = elR + np.degrees(dR / (8 * 6371.0))
-    hors |= (elT < -0.3) | (elR < -0.3)
+    hors |= (elT < 0.0) | (elR < 0.0)      # sous l'horizon apparent (la tolérance de −0,3° laissait passer des vols
+                                           # à ~470 km de GRAVES, hors de sa portée réelle)
     fd[hors] = np.nan
     return dict(fd=fd, dT=dT, dR=dR, lat=lat, lon=lon, alt=alt)
 
@@ -330,8 +382,12 @@ def detections(norm, f, fd_path, tol_hz, seuil_db):
     return (cols[hit], f[kp], f[kp] - fd_path[cols[hit]]), int(dedans.sum())
 
 
-def masquer_porteuse(norm, f_rel, largeur_hz=1.5):
-    """Copie de la cascade où la porteuse directe (0 Hz) ne peut pas être prise pour un écho."""
+GARDE_PORTEUSE_HZ = 6.0   # tranches où la courbe prévue passe à moins de 6 Hz de la porteuse : non comptées
+
+
+def masquer_porteuse(norm, f_rel, largeur_hz=3.0):
+    """Copie de la cascade où la porteuse directe (0 Hz) ne peut pas être prise pour un écho. ±3 Hz : une porteuse
+    forte (+15 à +25 dB) déborde de ±1,5 Hz par les lobes de la fenêtre et l'étalement aux commutations de faisceau."""
     m = norm.copy()
     m[np.abs(f_rel) <= largeur_hz, :] = -99.0
     return m
@@ -456,10 +512,13 @@ def correler(norm, f_rel, temps_abs, pistes, rx, p):
             continue
         if np.nanmin(np.abs(c["fd"])) > p.largeur or np.nanmin(c["dT"]) > p.portee:
             continue
-        det, n = detections(nm, f_rel, c["fd"], p.tolerance, p.seuil)
-        if n == 0:
+        # seules comptent les tranches où la prédiction est loin de la porteuse : près d'elle, ses débordements
+        # fourniraient des « pics » à chaque tranche, et un vol qui la longe serait reconnu sur la porteuse seule
+        fd_eval = np.where(np.abs(c["fd"]) > GARDE_PORTEUSE_HZ, c["fd"], np.nan)
+        det, n = detections(nm, f_rel, fd_eval, p.tolerance, p.seuil)
+        if n < 20:                                 # trop peu de tranches exploitables hors porteuse
             continue
-        nulls = [presence(nm, f_rel, c["fd"] + d, p.tolerance, p.seuil)[0]
+        nulls = [presence(nm, f_rel, fd_eval + d, p.tolerance, p.seuil)[0]
                  for d in (-61.0, -37.0, -23.0, 29.0, 43.0, 71.0)]
         nulls = [x for x in nulls if not np.isnan(x)]
         cands.append(dict(hex=h, flight=next((r["flight"] for r in reversed(piste) if r.get("flight")), h),
@@ -616,13 +675,19 @@ def main():
     j = sp.add_parser("journal", help="enregistrer les positions ADS-B en continu")
     j.add_argument("--source", action="append", default=None,
                    help="source de positions, répétable : local (readsb), adsbfi (API adsb.fi), ou un fichier/URL "
-                        "aircraft.json. Défaut : local. Exemple : --source local --source adsbfi")
+                        "aircraft.json. Défaut : local (adsbfi avec --terrain). Exemple : --source local --source adsbfi")
+    j.add_argument("--terrain", action="store_true",
+                   help=f"réglages pour une connexion mobile : compression gzip, une requête adsb.fi toutes les "
+                        f"{PERIODE_TERRAIN_S:g} s, rayon {RAYON_TERRAIN_NM:.0f} NM, source adsbfi si aucune --source "
+                        f"n'est donnée. --rayon-nm et --periode-adsbfi, s'ils sont donnés, restent prioritaires")
     j.add_argument("--local", default="/run/readsb/aircraft.json", help="aircraft.json du readsb local")
     j.add_argument("--centre", type=float, nargs=2, default=CENTRE_DEFAUT, metavar=("LAT", "LON"),
                    help="centre de la zone interrogée sur adsb.fi (défaut : GRAVES)")
-    j.add_argument("--rayon-nm", dest="rayon_nm", type=float, default=250, help="rayon adsb.fi (NM, max 250)")
-    j.add_argument("--periode-adsbfi", dest="periode_adsbfi", type=float, default=2.0,
-                   help="secondes entre deux requêtes adsb.fi (min 1, limite du service)")
+    j.add_argument("--rayon-nm", dest="rayon_nm", type=float, default=None,
+                   help=f"rayon adsb.fi (NM, max 250 ; défaut {RAYON_MAISON_NM:.0f}, {RAYON_TERRAIN_NM:.0f} avec --terrain)")
+    j.add_argument("--periode-adsbfi", dest="periode_adsbfi", type=float, default=None,
+                   help=f"secondes entre deux requêtes adsb.fi (min 1, limite du service ; défaut "
+                        f"{PERIODE_MAISON_S:g}, {PERIODE_TERRAIN_S:g} avec --terrain)")
     j.add_argument("--url-adsbfi", dest="url_adsbfi", default=None, help=argparse.SUPPRESS)
     j.add_argument("--dossier", default=".")
 
@@ -646,8 +711,13 @@ def main():
                    help="ne pas corriger la dérive de l'oscillateur du récepteur")
     s.add_argument("--tous", action="store_true", help="tracer aussi (en pointillés) les vols non identifiés")
     args = p.parse_args()
-    if args.mode == "journal" and not args.source:
-        args.source = ["local"]
+    if args.mode == "journal":
+        if not args.source:
+            args.source = ["adsbfi"] if args.terrain else ["local"]
+        if args.rayon_nm is None:
+            args.rayon_nm = RAYON_TERRAIN_NM if args.terrain else RAYON_MAISON_NM
+        if args.periode_adsbfi is None:
+            args.periode_adsbfi = PERIODE_TERRAIN_S if args.terrain else PERIODE_MAISON_S
     (mode_journal if args.mode == "journal" else mode_superpose)(args)
 
 

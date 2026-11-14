@@ -10,10 +10,14 @@ Usage (options identiques à graves_capture.py) :
   python3 graves_v2.py --live --analyse                # cascade en direct + identification, aucun fichier
   python3 graves_v2.py --duree 300 --iq --analyse      # idem, avec enregistrement (IQ + PNG en fin de capture)
   python3 graves_v2.py --simulation --live --analyse   # essai sans matériel
-Options propres à la V2 : --ips (défaut 15), --opengl (rendu OpenGL, nécessite PyOpenGL)
+Options propres à la V2 : --ips (défaut 15), --opengl (rendu OpenGL, nécessite PyOpenGL),
+  --dyn DB (échelle de couleurs : 0 à DB au-dessus du fond, défaut 20 ; 30 à 40 si les échos sont très forts)
 
 Bouton « Capture » (ou F12) : image PNG de la fenêtre, nommée graves_ecran_AAAAMMJJ_HHMMSS.png (UTC),
 dans le dossier courant — aussi en mode --live.
+Boutons « + » et « − » (ou touches + et −, pavé numérique compris) : la cascade fine (avions) s'élargit ou
+se rétrécit de 100 pixels, la cascade rapide (satellites, météores) prend ou rend la différence : la largeur
+totale ne change pas. La proportion choisie est conservée si la fenêtre est redimensionnée.
 Fermer la fenêtre ou Ctrl-C arrête l'acquisition ; en mode enregistrement, ce qui a été capté
 jusque-là est sauvegardé normalement.
 
@@ -32,6 +36,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import graves_capture as gc                                            # noqa: E402
 
 TITRE_FENETRE = "GRAVES — cascade en direct (V2)"
+PAS_LARGEUR_PX = 100          # boutons + / − : variation de largeur de la cascade fine (avions)
+LARGEUR_MIN_PX = 300          # aucune des deux cascades ne descend sous cette largeur (ni sous sa largeur
+                              # minimale naturelle : axes, titre, légende des couleurs)
 
 
 # ------------------------------------------------------------------------------- repères (pyqtgraph)
@@ -104,6 +111,11 @@ def creer_fenetre(args, moteur, analyse, fil, t_dep, total):
     import pyqtgraph as pg
     from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+    STYLE_BOUTON = ("QPushButton { color: #e8e8e8; background-color: #303030; border: 1px solid #606060;"
+                    " border-radius: 4px; padding: 4px 12px; font-size: 12px; }"
+                    "QPushButton:hover { background-color: #454545; }"
+                    "QPushButton:pressed { background-color: #606060; }")
+
     class Fenetre(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
@@ -117,39 +129,57 @@ def creer_fenetre(args, moteur, analyse, fil, t_dep, total):
             self.titre = QtWidgets.QLabel(gc.titre_direct(args))
             self.titre.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.titre.setStyleSheet("color: #e8e8e8; font-size: 13px;")
-            # bandeau du haut : titre centré, bouton de capture d'écran à droite
+            # bandeau du haut : titre centré ; à droite, boutons de largeur (− +) et de capture d'écran
             bandeau = QtWidgets.QHBoxLayout()
             self.bouton = QtWidgets.QPushButton("Capture")
             self.bouton.setToolTip("Enregistre une image de la fenêtre (raccourci : F12)")
-            self.bouton.setStyleSheet(
-                "QPushButton { color: #e8e8e8; background-color: #303030; border: 1px solid #606060;"
-                " border-radius: 4px; padding: 4px 12px; font-size: 12px; }"
-                "QPushButton:hover { background-color: #454545; }"
-                "QPushButton:pressed { background-color: #606060; }")
+            self.bouton.setStyleSheet(STYLE_BOUTON)
             self.bouton.clicked.connect(self.capturer_ecran)
             QtGui.QShortcut(QtGui.QKeySequence("F12"), self, activated=self.capturer_ecran)
-            self.message = QtWidgets.QLabel("")       # confirmation d'enregistrement, à gauche
+            self.moins = QtWidgets.QPushButton("−")
+            self.plus = QtWidgets.QPushButton("+")
+            for b, sens, aide in ((self.moins, -1, "rétrécit"), (self.plus, +1, "élargit")):
+                b.setToolTip(f"{aide.capitalize()} la cascade des avions de {PAS_LARGEUR_PX} pixels "
+                             f"(touche {'−' if sens < 0 else '+'}) ; l'autre cascade compense")
+                b.setStyleSheet(STYLE_BOUTON)
+                b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)   # les touches + et − restent à la fenêtre
+                b.clicked.connect(lambda _=False, s=sens: self.changer_largeur(s))
+            self.bouton.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            self.message = QtWidgets.QLabel("")       # confirmations (capture, largeurs), à gauche
             self.message.setStyleSheet("color: #8fd18f; font-size: 11px;")
             self.message.setFixedWidth(300)
+            self.effacement = QtCore.QTimer()          # le message disparaît après 5 s
+            self.effacement.setSingleShot(True)
+            self.effacement.timeout.connect(lambda: self.message.setText(""))
             droite = QtWidgets.QWidget()               # même largeur à droite : le titre reste centré
             droite.setFixedWidth(300)
             hd = QtWidgets.QHBoxLayout(droite)
             hd.setContentsMargins(0, 0, 0, 0)
+            hd.setSpacing(4)
             hd.addStretch(1)
+            hd.addWidget(self.moins)
+            hd.addWidget(self.plus)
+            hd.addSpacing(8)
             hd.addWidget(self.bouton)
             bandeau.addWidget(self.message)
             bandeau.addWidget(self.titre, 1)
             bandeau.addWidget(droite)
             vbox.addLayout(bandeau)
             self.glw = pg.GraphicsLayoutWidget()
+            self.glw.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
             vbox.addWidget(self.glw, 1)
             self.setCentralWidget(centre)
 
             self.p1 = self.glw.addPlot(row=0, col=0)
             self.p2 = self.glw.addPlot(row=0, col=1)
             lay = self.glw.ci.layout
-            lay.setColumnStretchFactor(0, 14)          # la cascade fine (avions) est la plus utile
+            lay.setColumnStretchFactor(0, 14)          # au départ : la cascade fine (avions) est la plus large
             lay.setColumnStretchFactor(1, 10)
+            self.part_fine = None                      # part de la largeur donnée aux avions, fixée par + / −
+            self.marge_px = 0
+            self.recalage = QtCore.QTimer()            # après un redimensionnement : réappliquer la part choisie
+            self.recalage.setSingleShot(True)
+            self.recalage.timeout.connect(self._appliquer_largeurs)
             pf = moteur.plage_fine
             self.p1.setTitle(f"Fine {pf[0]:+.0f} à {pf[1]:+.0f} Hz (0,5 Hz) — avions, porteuse".replace("-", "−"),
                              size="10pt")
@@ -166,7 +196,7 @@ def creer_fenetre(args, moteur, analyse, fil, t_dep, total):
             self.barre = pg.ColorBarItem(values=(0, moteur.dyn), colorMap=pg.colormap.get("magma"),
                                          orientation="horizontal", interactive=False, width=10,
                                          label="dB au-dessus du fond")
-            sous = self.glw.addLayout(row=1, col=1)   # barre centrée, sur la moitié de la largeur
+            sous = self.sous = self.glw.addLayout(row=1, col=1)   # barre centrée, sur la moitié de la largeur
             sous.addLabel("", col=0)
             sous.addItem(self.barre, col=1)
             sous.addLabel("", col=2)
@@ -181,6 +211,78 @@ def creer_fenetre(args, moteur, analyse, fil, t_dep, total):
             self.minuterie.timeout.connect(self.tick)
             self.minuterie.start(max(10, int(1000 / args.ips)))
 
+        # ---------------------------------------------------------------- largeur des deux cascades
+        def _largeurs(self):
+            """Largeurs actuelles (pixels) des cascades fine et rapide, axes compris."""
+            return self.p1.geometry().width(), self.p2.geometry().width()
+
+        def _minimums(self):
+            """Largeurs minimales (pixels) des colonnes fine et rapide."""
+            mini = QtCore.Qt.SizeHint.MinimumSize
+            m1 = self.p1.effectiveSizeHint(mini).width()
+            m2 = max(self.p2.effectiveSizeHint(mini).width(), self.sous.effectiveSizeHint(mini).width())
+            return max(LARGEUR_MIN_PX, m1), max(LARGEUR_MIN_PX, m2)
+
+        def _somme(self):
+            """Largeur disponible pour les deux cascades : zone graphique moins marges et espacement
+            (mesurés au premier appui, constants ensuite)."""
+            return self.glw.viewport().width() - self.marge_px
+
+        def changer_largeur(self, sens):
+            """Élargit (sens = +1) ou rétrécit (−1) la cascade des avions de PAS_LARGEUR_PX pixels ;
+            la cascade rapide compense : la somme des deux largeurs reste constante.
+            La largeur visée est mémorisée (part_fine) : des appuis rapprochés s'additionnent même si
+            Qt n'a pas encore refait la mise en page entre deux appuis."""
+            if self.part_fine is None:                 # premier appui : état de départ (proportion 14:10)
+                w1, w2 = self._largeurs()
+                if w1 + w2 <= 0:
+                    return
+                self.marge_px = round(self.glw.viewport().width() - (w1 + w2))
+                self.part_fine = w1 / (w1 + w2)
+            somme = self._somme()
+            m1, m2 = self._minimums()
+            if somme <= m1 + m2:
+                return
+            w1 = self.part_fine * somme
+            n1 = round(min(max(w1 + sens * PAS_LARGEUR_PX, m1), somme - m2))
+            if abs(n1 - w1) < 1:
+                self._informer(f"Limite atteinte : {m1:.0f} px minimum pour les avions, "
+                               f"{m2:.0f} px pour les satellites / météores")
+                return
+            self.part_fine = n1 / somme
+            self.glw.ci.layout.setColumnFixedWidth(0, n1)          # la colonne 1 prend le reste
+            self._informer(f"Avions : {n1} px · satellites / météores : {somme - n1} px")
+
+        def _appliquer_largeurs(self):
+            """Après un redimensionnement de la fenêtre : même proportion qu'avant."""
+            if self.part_fine is None:
+                return
+            somme = self._somme()
+            m1, m2 = self._minimums()
+            if somme > m1 + m2:
+                n1 = round(min(max(self.part_fine * somme, m1), somme - m2))
+                self.glw.ci.layout.setColumnFixedWidth(0, n1)
+
+        def resizeEvent(self, evt):
+            super().resizeEvent(evt)
+            if self.part_fine is not None:
+                self.recalage.start(80)                # une fois la nouvelle mise en page faite
+
+        def keyPressEvent(self, evt):
+            k = evt.key()
+            if k in (QtCore.Qt.Key.Key_Plus, QtCore.Qt.Key.Key_Equal):
+                self.changer_largeur(+1)
+            elif k in (QtCore.Qt.Key.Key_Minus, QtCore.Qt.Key.Key_Underscore):
+                self.changer_largeur(-1)
+            else:
+                super().keyPressEvent(evt)
+
+        def _informer(self, texte, ok=True):
+            self.message.setText(texte)
+            self.message.setStyleSheet(f"color: {'#8fd18f' if ok else '#ff7070'}; font-size: 11px;")
+            self.effacement.start(5000)
+
+        # ---------------------------------------------------------------- images
         def _creer_images(self):
             d_fin = moteur.l_fin * moteur.h_fin / moteur.fs
             d_rap = moteur.l_rap * moteur.h_rap / moteur.fs
@@ -244,9 +346,7 @@ def creer_fenetre(args, moteur, analyse, fil, t_dep, total):
             ok = self.grab().save(nom, "PNG")
             texte = f"Capture enregistrée : {nom}" if ok else f"Échec de l'enregistrement de {nom}"
             print(texte)
-            self.message.setText(texte)
-            self.message.setStyleSheet(f"color: {'#8fd18f' if ok else '#ff7070'}; font-size: 11px;")
-            QtCore.QTimer.singleShot(5000, lambda: self.message.setText(""))
+            self._informer(texte, ok)
 
         def closeEvent(self, evt):
             args.arret.set()                           # fermer la fenêtre arrête l'acquisition
@@ -261,7 +361,12 @@ def main():
     p.set_defaults(ips=15.0)
     p.add_argument("--opengl", action="store_true",
                    help="rendu OpenGL de pyqtgraph (nécessite PyOpenGL ; à essayer si l'affichage reste lent)")
+    p.add_argument("--dyn", type=float, default=20.0, metavar="DB",
+                   help="échelle de couleurs des cascades : de 0 à DB au-dessus du fond (défaut 20 ; 30 à 40 "
+                        "quand les échos sont très forts, près de GRAVES). Affichage seulement : l'analyse "
+                        "(avions, satellites, météores) n'en dépend pas")
     args = gc.preparer(p.parse_args())
+    args.dyn = min(max(args.dyn, 5.0), 80.0)
     if args.liste:
         gc.lister()
         return
@@ -285,7 +390,8 @@ def main():
 
     analyse = gc.creer_analyse(args)
     moteur = gc.Afficheur(gc.titre_direct(args), analyse=analyse, plage_fine=args.plage_fine,
-                          porteuse=args.porteuse)   # calcul des cascades
+                          porteuse=args.porteuse, dyn_db=args.dyn,
+                          zone_porteuse=args.zone_porteuse)   # calcul des cascades
     dec.ecouteur = moteur.recevoir
     fil = threading.Thread(target=acquisition, args=(args, dec), daemon=True)
     total = args.duree + (0 if args.simulation else args.prechauffage)

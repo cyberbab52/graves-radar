@@ -3,6 +3,9 @@ numpy
 scipy
 matplotlib
 
+# Récepteur GPS logiciel (graves_gps.py) : fortement conseillé, poursuite ~15× plus rapide
+numba
+
 # Mécanique orbitale (graves_satellites.py, graves_doppler.py)
 sgp4
 skyfield
